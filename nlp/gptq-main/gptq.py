@@ -1,171 +1,111 @@
-import math
-import time
-
 import torch
 import torch.nn as nn
-import transformers
-
-from quant import *
-
-
-DEBUG = False 
-
-torch.backends.cuda.matmul.allow_tf32 = False
-torch.backends.cudnn.allow_tf32 = False
-
+from .quantizer import Quantizer
 
 class GPTQ:
+    def __init__(self, model, layer_names, device):
+        self.model = model
+        self.layer_names = layer_names
+        self.device = device
+        self.quantized_weights = {}
+        
+        # 层类型关键词定义
+        self.attention_keywords = {"q_proj", "k_proj", "v_proj", "o_proj"}
+        self.ffn_keywords = {"gate_proj", "up_proj", "down_proj"}
 
-    def __init__(self, layer):
-        self.layer = layer
-        self.dev = self.layer.weight.device
-        W = layer.weight.data.clone()
-        if isinstance(self.layer, nn.Conv2d):
+    def _get_layer_type(self, layer_name):
+        """识别层类型（注意力层/前馈层）"""
+        for kw in self.attention_keywords:
+            if kw in layer_name:
+                return "attention"
+        for kw in self.ffn_keywords:
+            if kw in layer_name:
+                return "ffn"
+        return "default"
+
+    def fasterquant(self, layer_name, W, block_size=128, damp=0.01, group_size=-1, act_order=True):
+        """动态精度量化函数"""
+        layer_type = self._get_layer_type(layer_name)
+        W = W.clone().to(self.device)
+        if W.ndim == 4:  # 处理卷积层权重（如存在）
             W = W.flatten(1)
-        if isinstance(self.layer, transformers.Conv1D):
-            W = W.t()
-        self.rows = W.shape[0]
-        self.columns = W.shape[1]
-        self.H = torch.zeros((self.columns, self.columns), device=self.dev)
-        self.nsamples = 0
 
-    def add_batch(self, inp, out):
-        if DEBUG:
-            self.inp1 = inp
-            self.out1 = out
-        if len(inp.shape) == 2:
-            inp = inp.unsqueeze(0)
-        tmp = inp.shape[0]
-        if isinstance(self.layer, nn.Linear) or isinstance(self.layer, transformers.Conv1D):
-            if len(inp.shape) == 3:
-                inp = inp.reshape((-1, inp.shape[-1]))
-            inp = inp.t()
-        if isinstance(self.layer, nn.Conv2d):
-            unfold = nn.Unfold(
-                self.layer.kernel_size,
-                dilation=self.layer.dilation,
-                padding=self.layer.padding,
-                stride=self.layer.stride
-            )
-            inp = unfold(inp)
-            inp = inp.permute([1, 0, 2])
-            inp = inp.flatten(1)
-        self.H *= self.nsamples / (self.nsamples + tmp)
-        self.nsamples += tmp
-        # inp = inp.float()
-        inp = math.sqrt(2 / self.nsamples) * inp.float()
-        # self.H += 2 / self.nsamples * inp.matmul(inp.t())
-        self.H += inp.matmul(inp.t())
+        # 根据层类型配置量化精度
+        if layer_type == "attention":
+            bits = 4  # 注意力层4bit量化
+        elif layer_type == "ffn":
+            bits = 2  # 前馈层2bit量化
+        else:
+            bits = 4  # 默认4bit
 
-    def fasterquant(
-        self, blocksize=128, percdamp=.01, groupsize=-1, actorder=False, static_groups=False
-    ):
-        W = self.layer.weight.data.clone()
-        if isinstance(self.layer, nn.Conv2d):
-            W = W.flatten(1)
-        if isinstance(self.layer, transformers.Conv1D):
-            W = W.t()
-        W = W.float()
+        # 初始化量化器
+        quantizer = Quantizer(
+            bits=bits,
+            perchannel=True,
+            sym=False,
+            mse=False
+        )
 
-        tick = time.time()
+        # 计算海森矩阵（误差建模）
+        H = torch.zeros(W.shape[1], W.shape[1], device=self.device)
+        nsamples = 0
 
-        if not self.quantizer.ready():
-            self.quantizer.find_params(W, weight=True)
+        def add_batch(x):
+            nonlocal nsamples, H
+            x = x.to(self.device)
+            x = x.float()
+            if len(x.shape) == 2:
+                x = x.unsqueeze(0)
+            x = x.reshape(-1, x.shape[-1])
+            n = x.shape[0]
+            h = x.t() @ x
+            H *= nsamples / (nsamples + n)
+            nsamples += n
+            H += h / nsamples
 
-        H = self.H
-        del self.H
-        dead = torch.diag(H) == 0
-        H[dead, dead] = 1
-        W[:, dead] = 0
+        # 注册前向钩子收集激活值计算海森矩阵
+        handles = []
+        for name, module in self.model.named_modules():
+            if layer_name in name and "weight" in name:
+                handles.append(module.register_forward_hook(
+                    lambda m, i, o: add_batch(o[0])
+                ))
 
-        if static_groups:
-            import copy
-            groups = []
-            for i in range(0, self.columns, groupsize):
-                quantizer = copy.deepcopy(self.quantizer)
-                quantizer.find_params(W[:, i:(i + groupsize)], weight=True)
-                groups.append(quantizer)
+        # 执行校准数据推理（需外部传入校准数据加载逻辑）
+        self.model(*self.calib_data)  # 假设calib_data已在外部设置
+        for h in handles:
+            h.remove()
 
-        if actorder:
-            perm = torch.argsort(torch.diag(H), descending=True)
-            W = W[:, perm]
-            H = H[perm][:, perm]
-            invperm = torch.argsort(perm)
-
-        Losses = torch.zeros_like(W)
-        Q = torch.zeros_like(W)
-
-        damp = percdamp * torch.mean(torch.diag(H))
-        diag = torch.arange(self.columns, device=self.dev)
-        H[diag, diag] += damp
+        # 海森矩阵处理（乔列斯基分解）
+        H += damp * torch.eye(H.shape[0], device=self.device)
         H = torch.linalg.cholesky(H)
-        H = torch.cholesky_inverse(H)
-        H = torch.linalg.cholesky(H, upper=True)
-        Hinv = H
 
-        for i1 in range(0, self.columns, blocksize):
-            i2 = min(i1 + blocksize, self.columns)
-            count = i2 - i1
+        # 分组建模与量化
+        Q = torch.zeros_like(W)
+        scale = torch.zeros(W.shape[0], device=self.device)
+        zero = torch.zeros(W.shape[0], device=self.device)
 
-            W1 = W[:, i1:i2].clone()
-            Q1 = torch.zeros_like(W1)
-            Err1 = torch.zeros_like(W1)
-            Losses1 = torch.zeros_like(W1)
-            Hinv1 = Hinv[i1:i2, i1:i2]
+        for i in range(0, W.shape[0], block_size):
+            end = min(i + block_size, W.shape[0])
+            w = W[i:end, :]
+            # 基于海森矩阵的误差补偿量化
+            q, s, z = quantizer.quantize(w, H)
+            Q[i:end, :] = q
+            scale[i:end] = s
+            zero[i:end] = z
 
-            for i in range(count):
-                w = W1[:, i]
-                d = Hinv1[i, i]
+        return Q.reshape(W.shape), scale, zero
 
-                if groupsize != -1:
-                    if not static_groups:
-                        if (i1 + i) % groupsize == 0:
-                            self.quantizer.find_params(W[:, (i1 + i):(i1 + i + groupsize)], weight=True)
-                    else:
-                        idx = i1 + i
-                        if actorder:
-                            idx = perm[idx]
-                        self.quantizer = groups[idx // groupsize]
-
-                q = quantize(
-                    w.unsqueeze(1), self.quantizer.scale, self.quantizer.zero, self.quantizer.maxq
-                ).flatten()
-                Q1[:, i] = q
-                Losses1[:, i] = (w - q) ** 2 / d ** 2
-
-                err1 = (w - q) / d
-                W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-                Err1[:, i] = err1
-
-            Q[:, i1:i2] = Q1
-            Losses[:, i1:i2] = Losses1 / 2
-
-            W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
-
-            if DEBUG:
-                self.layer.weight.data[:, :i2] = Q[:, :i2]
-                self.layer.weight.data[:, i2:] = W[:, i2:]
-                print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
-                print(torch.sum(Losses))
-
-        torch.cuda.synchronize()
-        print('time %.2f' % (time.time() - tick))
-        print('error', torch.sum(Losses).item())
-
-        if actorder:
-            Q = Q[:, invperm]
-
-        if isinstance(self.layer, transformers.Conv1D):
-            Q = Q.t()
-        self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        if DEBUG:
-            print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
-
-    def free(self):
-        if DEBUG:
-            self.inp1 = None
-            self.out1 = None
-        self.H = None
-        self.Losses = None
-        self.Trace = None
-        torch.cuda.empty_cache()
+    def quantize_layers(self, calib_data):
+        """量化所有指定层"""
+        self.calib_data = calib_data  # 保存校准数据
+        for name in self.layer_names:
+            if hasattr(self.model, name):
+                layer = getattr(self.model, name)
+                if hasattr(layer, "weight"):
+                    W = layer.weight.data
+                    q_weight, scale, zero = self.fasterquant(name, W)
+                    self.quantized_weights[name] = (q_weight, scale, zero)
+                    # 更新模型权重为量化后权重
+                    layer.weight.data = q_weight
+        return self.model
